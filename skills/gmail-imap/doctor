@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""doctor - diagnose gmmail's runtime dependencies.
+
+Checks every layer the gmmail CLI needs, in order, and prints PASS/FAIL with
+an actionable fix for each failure. Exit code 0 if all hard checks pass,
+1 otherwise. Safe to run anytime: it changes nothing (except creating the
+data directory if missing).
+
+Run: ./doctor from the skill directory.
+"""
+
+import os
+import shutil
+import socket
+import sqlite3
+import ssl
+import subprocess
+import sys
+import tempfile
+
+IMAP_HOST = os.environ.get("GMMAIL_HOST", "imap.gmail.com")
+IMAP_PORT = int(os.environ.get("GMMAIL_PORT", "993"))
+KEYCHAIN_SERVICE = "gmmail-gmail"
+DATA_DIR = os.path.expanduser(os.environ.get("GMMAIL_DATA", "~/.local/share/gmmail"))
+DB_PATH = os.path.join(DATA_DIR, "mail.db")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+
+def configured_account():
+    """$GMMAIL_ACCOUNT, else the account written by `gmmail setup`. May be None."""
+    a = os.environ.get("GMMAIL_ACCOUNT")
+    if a:
+        return a
+    try:
+        import json
+        with open(CONFIG_PATH) as f:
+            return json.load(f).get("account")
+    except (OSError, ValueError):
+        return None
+
+ACCOUNT = configured_account()
+
+failures = 0
+
+def check(ok, label, fix=None, info=None):
+    global failures
+    mark = "PASS" if ok else "FAIL"
+    line = f"[{mark}] {label}"
+    if ok and info:
+        line += f"  ({info})"
+    print(line)
+    if not ok:
+        failures += 1
+        if fix:
+            print(f"       fix: {fix}")
+    return ok
+
+def note(text):
+    print(f"       {text}")
+
+# 1. python version (gmmail needs 3.9+ for imaplib's timeout parameter)
+v = sys.version_info
+check(v >= (3, 9), "python3 version", info=".".join(map(str, v[:3])),
+      fix="install Python 3.9+ (e.g. `brew install python3`)")
+
+# 2. sqlite3 with FTS5 (the search index needs it)
+try:
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+    check(True, "sqlite3 FTS5 extension", info=sqlite3.sqlite_version)
+except Exception as e:
+    check(False, "sqlite3 FTS5 extension", fix=f"python3 sqlite3 lacks FTS5: {e}")
+
+# 3. macOS `security` CLI (Keychain access)
+check(shutil.which("security") is not None, "`security` CLI on PATH",
+      fix="expected on macOS; if missing, set GMMAIL_PASSWORD instead")
+
+# 4. account configured, then credentials available; never print the secret
+acct_ok = check(ACCOUNT is not None, "account configured",
+                info="$GMMAIL_ACCOUNT" if os.environ.get("GMMAIL_ACCOUNT") else "gmmail setup config",
+                fix="run `gmmail setup` (stores only the email address in "
+                    f"{CONFIG_PATH}), or set GMMAIL_ACCOUNT")
+pw = os.environ.get("GMMAIL_PASSWORD")
+cred_source = "GMMAIL_PASSWORD env var" if pw else None
+if not pw and acct_ok:
+    r = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", ACCOUNT, "-w"],
+        capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        pw = r.stdout.strip()
+        cred_source = f"Keychain (service '{KEYCHAIN_SERVICE}')"
+check(pw is not None, "app password available", info=cred_source,
+      fix="run `gmmail setup` to store a Google app password in Keychain "
+          "(myaccount.google.com/apppasswords, requires 2FA), or set GMMAIL_PASSWORD")
+
+# 5. Gmail IMAP TCP port reachable
+try:
+    with socket.create_connection((IMAP_HOST, IMAP_PORT), timeout=5):
+        check(True, f"{IMAP_HOST}:{IMAP_PORT} reachable")
+        host_up = True
+except OSError as e:
+    check(False, f"{IMAP_HOST}:{IMAP_PORT} reachable",
+          fix=f"check your internet connection / firewall ({e})")
+    host_up = False
+
+# 6. verified TLS handshake + LOGIN + LIST (also reports system mailboxes)
+if host_up and pw:
+    try:
+        import imaplib
+        ctx = ssl.create_default_context()  # real cert verification
+        m = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx, timeout=15)
+        m.login(ACCOUNT or "", pw)
+        typ, boxes = m.list()
+        n = len(boxes or [])
+        import re as _re
+        sys_boxes = sorted({b.decode(errors="replace")
+                            for b in (boxes or []) if isinstance(b, bytes)
+                            and b"[Gmail]/" in b})
+        m.logout()
+        check(True, "TLS + login + LIST", info=f"{n} mailboxes")
+        for name in sys_boxes[:8]:
+            note(f"system mailbox: {name.split(' ', 2)[-1].strip(chr(34))}")
+        if any("[Gmail]/Bin" in b for b in sys_boxes):
+            note("UK-localised account detected ([Gmail]/Bin) - alias "
+                 "resolution handles this automatically")
+    except imaplib.IMAP4.error as e:
+        check(False, "TLS + login + LIST",
+              fix=f"Gmail rejected login: {e}. IMAP needs an app password "
+                  f"(myaccount.google.com/apppasswords, requires 2FA) - your "
+                  f"normal Google password will not work. Re-run `gmmail setup`")
+    except (OSError, ssl.SSLError) as e:
+        check(False, "TLS + login + LIST", fix=f"handshake failed: {e}")
+elif not host_up:
+    note("skipping login check (host unreachable)")
+else:
+    note("skipping login check (no credentials)")
+
+# 7. data directory present and writable
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with tempfile.TemporaryFile(dir=DATA_DIR):
+        pass
+    check(True, "data directory writable", info=DATA_DIR)
+except OSError as e:
+    check(False, "data directory writable",
+          fix=f"check permissions on {DATA_DIR} ({e})")
+
+# 8. cache database opens, has schema, and is consistent (informational)
+if os.path.exists(DB_PATH):
+    try:
+        db = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
+        counts = dict(db.execute("SELECT mailbox, COUNT(*) FROM messages GROUP BY mailbox"))
+        total = sum(counts.values())
+        sync = db.execute("SELECT MAX(synced_at) FROM sync_state").fetchone()[0]
+        db.close()
+        size_mb = os.path.getsize(DB_PATH) / 1e6
+        check(True, "cache database readable",
+              info=f"{total:,} messages in {len(counts)} mailboxes, {size_mb:,.0f} MB")
+        if sync:
+            from datetime import datetime, timezone
+            age_h = (__import__("time").time() - sync) / 3600
+            note(f"last sync: {datetime.fromtimestamp(sync, timezone.utc):%Y-%m-%d %H:%M} UTC "
+                 f"({age_h:.1f}h ago)")
+        if total == 0:
+            note("cache is empty - run `gmmail sync --all --full` to backfill")
+    except sqlite3.Error as e:
+        check(False, "cache database readable",
+              fix=f"database looks corrupt ({e}); it is fully rebuildable: "
+                  f"delete {DB_PATH} and run `gmmail sync --all --full`")
+else:
+    note(f"no cache database yet at {DB_PATH}")
+    note("run `gmmail sync --all --full` to build it (search/list work live until then)")
+
+# 9. free disk space for cache growth (informational)
+free_gb = shutil.disk_usage(DATA_DIR).free / 1e9
+check(free_gb > 1, "free disk space", info=f"{free_gb:.0f} GB available",
+      fix="free up disk space; the full-archive cache can grow to several GB")
+
+print()
+if failures:
+    print(f"doctor: {failures} check(s) FAILED - see fixes above")
+    sys.exit(1)
+print("doctor: all checks passed")

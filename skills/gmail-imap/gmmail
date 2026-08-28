@@ -1,0 +1,967 @@
+#!/usr/bin/env python3
+"""gmmail - read a personal Gmail account via Gmail's IMAP server.
+
+Zero dependencies (Python 3 stdlib only). Strictly read-only: bodies are
+fetched with BODY.PEEK, mailboxes are opened with EXAMINE, and no command
+ever stores flags, moves, or deletes mail.
+
+Auth: Google app password (myaccount.google.com/apppasswords, requires 2FA),
+stored in macOS Keychain. Cache: ~/.local/share/gmmail/mail.db (SQLite +
+FTS5, rebuildable). Override the server with GMMAIL_HOST / GMMAIL_PORT.
+
+All data commands print JSON on stdout; progress and errors go to stderr.
+"""
+
+import argparse
+import getpass
+import imaplib
+import json
+import os
+import re
+import sqlite3
+import ssl
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from email import policy
+from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
+
+IMAP_HOST = os.environ.get("GMMAIL_HOST", "imap.gmail.com")
+IMAP_PORT = int(os.environ.get("GMMAIL_PORT", "993"))
+KEYCHAIN_SERVICE = "gmmail-gmail"
+DATA_DIR = os.path.expanduser(os.environ.get("GMMAIL_DATA", "~/.local/share/gmmail"))
+DB_PATH = os.path.join(DATA_DIR, "mail.db")
+ATTACH_DIR = os.path.join(DATA_DIR, "attachments")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+
+def account():
+    """Gmail address: $GMMAIL_ACCOUNT, else the config written by setup."""
+    a = os.environ.get("GMMAIL_ACCOUNT")
+    if a:
+        return a
+    try:
+        with open(CONFIG_PATH) as f:
+            a = json.load(f).get("account")
+            if a:
+                return a
+    except (OSError, json.JSONDecodeError):
+        pass
+    die("no account configured - run `gmmail setup` first (or set GMMAIL_ACCOUNT)")
+
+DEFAULT_LIMIT = 20
+SYNC_STALENESS = 60      # seconds; implicit sync runs at most this often
+QUICK_SEED = 500         # newest N UIDs synced on every incremental sync
+BACKFILL_BATCH = 200     # UID window per backfill step (cursor persisted per step)
+FETCH_CHUNK = 100        # messages per IMAP FETCH command
+
+# ---------------------------------------------------- gmail mailbox naming
+# Gmail exposes labels as IMAP mailboxes. System ones live under [Gmail]/
+# and are LOCALISED by account language (e.g. UK accounts get [Gmail]/Bin
+# instead of [Gmail]/Trash). The stable ground truth is the LIST special-use
+# attribute (\All, \Sent, ...); setup discovers real names and stores them in
+# config.json, and resolve_mailbox() maps friendly aliases to real names.
+
+SYSTEM_ALIASES = {          # lowercase friendly name -> system key
+    "all mail": "all_mail", "all": "all_mail",
+    "sent": "sent", "sent mail": "sent",
+    "drafts": "drafts",
+    "starred": "starred", "flagged": "starred",
+    "spam": "spam", "junk": "spam",
+    "trash": "trash", "bin": "trash",
+    "important": "important",
+}
+DEFAULT_GMAIL_NAMES = {     # system key -> US-English IMAP name
+    "all_mail": "[Gmail]/All Mail",
+    "sent": "[Gmail]/Sent Mail",
+    "drafts": "[Gmail]/Drafts",
+    "starred": "[Gmail]/Starred",
+    "spam": "[Gmail]/Spam",
+    "trash": "[Gmail]/Trash",
+    "important": "[Gmail]/Important",
+}
+SPECIAL_USE_ATTR = {        # LIST attribute -> system key
+    "\\All": "all_mail", "\\Sent": "sent", "\\Drafts": "drafts",
+    "\\Flagged": "starred", "\\Junk": "spam", "\\Trash": "trash",
+    "\\Important": "important",
+}
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_config(cfg):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
+
+def resolve_mailbox(name):
+    """Friendly alias -> real IMAP mailbox name (localisation-aware)."""
+    if name.upper() == "INBOX":
+        return "INBOX"
+    key = SYSTEM_ALIASES.get(name.lower())
+    if key:
+        return load_config().get("mailboxes", {}).get(key) or DEFAULT_GMAIL_NAMES[key]
+    return name
+
+# ---------------------------------------------------------------- utilities
+
+def die(msg, code=1):
+    print(f"gmmail: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def log(msg):
+    print(msg, file=sys.stderr)
+
+def emit(obj):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+def quote_mailbox(name):
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+def iso(ts):
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def web_url(meta):
+    """Gmail web link for a thread id (X-GM-THRID); URLs use hex ids."""
+    thrid = meta.get("gm_thrid")
+    return f"https://mail.google.com/mail/u/0/#all/{thrid:x}" if thrid else None
+
+# ------------------------------------------------------------- credentials
+
+def get_password():
+    pw = os.environ.get("GMMAIL_PASSWORD")
+    if pw:
+        return pw
+    r = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account(), "-w"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"no credentials: store a Google app password with `gmmail setup`, "
+            f"or set GMMAIL_PASSWORD (Keychain service '{KEYCHAIN_SERVICE}', account '{account()}')")
+    return r.stdout.rstrip("\n")
+
+# ------------------------------------------------------------------- IMAP
+
+def connect():
+    """Connect + login over verified TLS. Dies with an actionable message."""
+    ctx = ssl.create_default_context()  # public CA host: full verification
+    try:
+        m = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx, timeout=30)
+    except (OSError, ssl.SSLError) as e:
+        die(f"cannot reach {IMAP_HOST}:{IMAP_PORT} - check your internet "
+            f"connection ({e})")
+    try:
+        m.login(account(), get_password())
+    except imaplib.IMAP4.error as e:
+        die(f"Gmail login failed for {account()}: {e}. Gmail IMAP does not accept "
+            f"your normal password - create an app password at "
+            f"myaccount.google.com/apppasswords (requires 2FA) and run `gmmail setup`.")
+    return m
+
+def try_connect():
+    """Like connect(), but returns None instead of dying (for implicit sync)."""
+    try:
+        return connect()
+    except SystemExit:
+        return None
+
+def open_box(m, box):
+    """EXAMINE a mailbox (read-only); die with a hint if the name is wrong."""
+    typ, _ = m.select(quote_mailbox(box), readonly=True)
+    if typ != "OK":
+        die(f"cannot open mailbox '{box}' - run `gmmail mailboxes` to list "
+            f"available names (system mailboxes are localised by account language)")
+
+UID_RE = re.compile(rb"UID (\d+)")
+FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
+GM_MSGID_RE = re.compile(rb"X-GM-MSGID (\d+)")
+GM_THRID_RE = re.compile(rb"X-GM-THRID (\d+)")
+
+def parse_fetch_meta(header):
+    def grab(rx):
+        m = rx.search(header)
+        return int(m.group(1)) if m else None
+    flags_m = FLAGS_RE.search(header)
+    return grab(UID_RE), {
+        "flags": flags_m.group(1).decode(errors="replace") if flags_m else "",
+        "gm_msgid": grab(GM_MSGID_RE),
+        "gm_thrid": grab(GM_THRID_RE),
+    }
+
+def iter_fetch(data):
+    """Yield (uid, meta, literal_bytes) from an imaplib FETCH response.
+    Gmail puts 'UID n' in the header BEFORE the literal; some servers append
+    it after, so combine each tuple's header with the trailing bytes item."""
+    for i, item in enumerate(data):
+        if isinstance(item, tuple):
+            blob = item[0]
+            if i + 1 < len(data) and isinstance(data[i + 1], bytes):
+                blob += data[i + 1]
+            uid, meta = parse_fetch_meta(blob)
+            if uid is not None and isinstance(item[1], bytes):
+                yield uid, meta, item[1]
+
+def fetch_full(m, uids):
+    """UID FETCH (FLAGS X-GM-MSGID X-GM-THRID BODY.PEEK[]) in chunks."""
+    for i in range(0, len(uids), FETCH_CHUNK):
+        chunk = uids[i:i + FETCH_CHUNK]
+        typ, data = m.uid("FETCH", ",".join(map(str, chunk)),
+                          "(FLAGS X-GM-MSGID X-GM-THRID BODY.PEEK[])")
+        if typ != "OK":
+            log(f"warning: FETCH failed for chunk starting at UID {chunk[0]}, skipping")
+            continue
+        yield from iter_fetch(data)
+
+def fetch_headers(m, uids):
+    """UID FETCH of header fields + Gmail ids -> list of summary dicts."""
+    out = []
+    fields = "(FLAGS X-GM-MSGID X-GM-THRID BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE)])"
+    for i in range(0, len(uids), FETCH_CHUNK):
+        chunk = uids[i:i + FETCH_CHUNK]
+        typ, data = m.uid("FETCH", ",".join(map(str, chunk)), fields)
+        if typ != "OK":
+            continue
+        for uid, meta, hdr_bytes in iter_fetch(data):
+            msg = BytesParser(policy=policy.default).parsebytes(hdr_bytes)
+            out.append({
+                "uid": uid,
+                "date": iso(parse_date(msg.get("Date"))),
+                "from": safe_str(msg.get("From")),
+                "to": safe_str(msg.get("To")),
+                "subject": safe_str(msg.get("Subject")),
+                "flags": meta["flags"],
+                "thrid": meta["gm_thrid"],
+            })
+    return out
+
+# ----------------------------------------------------------------- parsing
+
+def safe_str(header):
+    if header is None:
+        return ""
+    try:
+        return str(header)
+    except Exception:
+        return str(header.raw) if hasattr(header, "raw") else ""
+
+def parse_date(header):
+    if header is None:
+        return None
+    try:
+        dt = parsedate_to_datetime(str(header))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+def part_text(part):
+    try:
+        content = part.get_content()
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+        return content or ""
+    except Exception:
+        try:
+            payload = part.get_payload(decode=True)
+            return payload.decode("utf-8", errors="replace") if payload else ""
+        except Exception:
+            return ""
+
+def parse_message(raw):
+    """Parse a raw RFC822 message into a cache record."""
+    msg = BytesParser(policy=policy.default).parsebytes(raw)
+    text_parts, html_parts, attachments = [], [], []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        ctype = part.get_content_type()
+        filename = part.get_filename()
+        if part.get_content_disposition() == "attachment" or filename:
+            try:
+                payload = part.get_payload(decode=True)
+            except Exception:
+                payload = None
+            attachments.append({
+                "index": len(attachments) + 1,
+                "name": filename or "unnamed",
+                "mime": ctype,
+                "size": len(payload) if payload else 0,
+            })
+        elif ctype == "text/plain":
+            text_parts.append(part_text(part))
+        elif ctype == "text/html":
+            html_parts.append(part_text(part))
+    body_text = "\n".join(p for p in text_parts if p).strip()
+    body_html = "\n".join(p for p in html_parts if p).strip()
+    if not body_text and body_html:
+        # most real mail is HTML-only; index the stripped text so FTS works
+        body_text = html_to_text(body_html)
+    else:
+        body_text = INVISIBLES_RE.sub("", body_text)
+    return {
+        "message_id": safe_str(msg.get("Message-ID")),
+        "date": parse_date(msg.get("Date")),
+        "from_addr": safe_str(msg.get("From")),
+        "to_addr": safe_str(msg.get("To")),
+        "cc": safe_str(msg.get("Cc")),
+        "subject": safe_str(msg.get("Subject")),
+        "size": len(raw),
+        "body_text": body_text,
+        "body_html": body_html,
+        "attachments": json.dumps(attachments, ensure_ascii=False),
+    }
+
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+HTML_STRIP_RE = re.compile(r"(?is)<(script|style|head)[^>]*>.*?</\1>|<!--.*?-->")
+INVISIBLES_RE = re.compile(
+    "[\u00ad\u034f\u200b-\u200f\u202a-\u202e\u2060\ufeff]")  # zero-width/format junk
+
+def html_to_text(html):
+    txt = HTML_STRIP_RE.sub(" ", html)   # drop style/script/head bodies + comments
+    txt = HTML_TAG_RE.sub(" ", txt)
+    txt = INVISIBLES_RE.sub("", txt)
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\n\s*\n\s*\n+", "\n\n", txt)
+    for ent, ch in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                    ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " ")):
+        txt = txt.replace(ent, ch)
+    return txt.strip()
+
+# ------------------------------------------------------------------- cache
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS messages (
+  mailbox TEXT NOT NULL,
+  uid INTEGER NOT NULL,
+  gm_msgid INTEGER,
+  gm_thrid INTEGER,
+  message_id TEXT,
+  date INTEGER,
+  from_addr TEXT,
+  to_addr TEXT,
+  cc TEXT,
+  subject TEXT,
+  flags TEXT DEFAULT '',
+  size INTEGER,
+  body_text TEXT,
+  body_html TEXT,
+  attachments TEXT DEFAULT '[]',
+  synced_at INTEGER,
+  PRIMARY KEY (mailbox, uid)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
+  subject, from_addr, to_addr, body_text,
+  content='messages', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO mail_fts(rowid, subject, from_addr, to_addr, body_text)
+  VALUES (new.rowid, new.subject, new.from_addr, new.to_addr, new.body_text);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO mail_fts(mail_fts, rowid, subject, from_addr, to_addr, body_text)
+  VALUES ('delete', old.rowid, old.subject, old.from_addr, old.to_addr, old.body_text);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+  INSERT INTO mail_fts(mail_fts, rowid, subject, from_addr, to_addr, body_text)
+  VALUES ('delete', old.rowid, old.subject, old.from_addr, old.to_addr, old.body_text);
+  INSERT INTO mail_fts(rowid, subject, from_addr, to_addr, body_text)
+  VALUES (new.rowid, new.subject, new.from_addr, new.to_addr, new.body_text);
+END;
+CREATE TABLE IF NOT EXISTS sync_state (
+  mailbox TEXT PRIMARY KEY,
+  uidvalidity INTEGER,
+  backfill_cursor INTEGER DEFAULT 0,
+  uidnext INTEGER,
+  synced_at INTEGER
+);
+"""
+
+UPSERT = """
+INSERT INTO messages
+  (mailbox, uid, gm_msgid, gm_thrid, message_id, date, from_addr, to_addr, cc,
+   subject, flags, size, body_text, body_html, attachments, synced_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(mailbox, uid) DO UPDATE SET
+  gm_msgid=excluded.gm_msgid, gm_thrid=excluded.gm_thrid,
+  message_id=excluded.message_id, date=excluded.date,
+  from_addr=excluded.from_addr, to_addr=excluded.to_addr, cc=excluded.cc,
+  subject=excluded.subject, flags=excluded.flags, size=excluded.size,
+  body_text=excluded.body_text, body_html=excluded.body_html,
+  attachments=excluded.attachments, synced_at=excluded.synced_at
+"""
+
+def open_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    db = sqlite3.connect(DB_PATH)
+    db.executescript(SCHEMA)
+    return db
+
+def insert_record(db, box, rec, uid, meta):
+    db.execute(UPSERT, (
+        box, uid, meta.get("gm_msgid"), meta.get("gm_thrid"),
+        rec["message_id"], rec["date"], rec["from_addr"], rec["to_addr"],
+        rec["cc"], rec["subject"], meta.get("flags", ""), rec["size"],
+        rec["body_text"], rec["body_html"], rec["attachments"],
+        int(time.time())))
+
+def cached_count(db, box):
+    return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox=?", (box,)).fetchone()[0]
+
+def get_sync_row(db, box):
+    return db.execute(
+        "SELECT uidvalidity, backfill_cursor, uidnext, synced_at FROM sync_state WHERE mailbox=?",
+        (box,)).fetchone()
+
+# -------------------------------------------------------------------- sync
+
+def mailbox_status(m, box):
+    typ, st = m.status(quote_mailbox(box), "(UIDVALIDITY UIDNEXT MESSAGES)")
+    if typ != "OK" or not st or not st[0]:
+        die(f"STATUS failed for mailbox '{box}'")
+    vals = dict(re.findall(r"(\w+) (\d+)", st[0].decode(errors="replace")))
+    return {"uidvalidity": int(vals.get("UIDVALIDITY", 0)),
+            "uidnext": int(vals.get("UIDNEXT", 1)),
+            "messages": int(vals.get("MESSAGES", 0))}
+
+def fetch_missing(db, m, box, uids):
+    """Fetch and cache any of `uids` not already in the db. Returns counts."""
+    if not uids:
+        return 0, 0
+    placeholders = ",".join("?" * len(uids))
+    have = {r[0] for r in db.execute(
+        f"SELECT uid FROM messages WHERE mailbox=? AND uid IN ({placeholders})",
+        (box, *uids))}
+    missing = [u for u in uids if u not in have]
+    fetched = 0
+    for uid, meta, raw in fetch_full(m, missing):
+        insert_record(db, box, parse_message(raw), uid, meta)
+        fetched += 1
+    db.commit()
+    return fetched, len(uids) - len(missing)
+
+def reconcile_flags(db, m, box):
+    """Pull FLAGS for every UID in the mailbox; update only rows that changed."""
+    typ, data = m.uid("FETCH", "1:*", "(FLAGS)")
+    if typ != "OK":
+        return 0
+    changed = 0
+    for item in data:
+        blob = item[0] if isinstance(item, tuple) else item
+        if not isinstance(blob, bytes):
+            continue
+        uid_m, flags_m = UID_RE.search(blob), FLAGS_RE.search(blob)
+        if uid_m and flags_m:
+            flags = flags_m.group(1).decode(errors="replace")
+            cur = db.execute(
+                "UPDATE messages SET flags=? WHERE mailbox=? AND uid=? AND flags != ?",
+                (flags, box, int(uid_m.group(1)), flags))
+            changed += cur.rowcount
+    db.commit()
+    return changed
+
+def sync_mailbox(db, m, box, full=False, batch=BACKFILL_BATCH, quick=QUICK_SEED,
+                 progress=True):
+    # STATUS before SELECT: RFC 3501 says clients should not STATUS the
+    # currently selected mailbox.
+    st = mailbox_status(m, box)
+    open_box(m, box)
+    row = get_sync_row(db, box)
+    if row is None:
+        cursor = 0
+        db.execute("INSERT INTO sync_state (mailbox, uidvalidity, backfill_cursor) VALUES (?,?,0)",
+                   (box, st["uidvalidity"]))
+        db.commit()
+    elif row[0] != st["uidvalidity"]:
+        if progress:
+            log(f"{box}: UIDVALIDITY changed ({row[0]} -> {st['uidvalidity']}); "
+                f"wiping {cached_count(db, box)} cached rows")
+        db.execute("DELETE FROM messages WHERE mailbox=?", (box,))
+        cursor = 0
+    else:
+        cursor = row[1]
+
+    typ, d = m.uid("SEARCH", "ALL")
+    server_uids = sorted(int(u) for u in d[0].split()) if d and d[0] else []
+    fetched = skipped = 0
+
+    # 1. recent-first seed: newest `quick` UIDs
+    f, s = fetch_missing(db, m, box, server_uids[-quick:])
+    fetched += f; skipped += s
+    if progress and f:
+        log(f"{box}: quick-seeded {f} recent message(s)")
+
+    # 2. resumable backfill over the contiguous UID range
+    if full and server_uids:
+        top = server_uids[-1]
+        while cursor < top:
+            lo, hi = cursor + 1, cursor + batch
+            chunk = [u for u in server_uids if lo <= u <= hi]
+            f, s = fetch_missing(db, m, box, chunk)
+            fetched += f; skipped += s
+            cursor = hi
+            db.execute(
+                "UPDATE sync_state SET backfill_cursor=?, uidvalidity=?, uidnext=?, synced_at=? "
+                "WHERE mailbox=?",
+                (cursor, st["uidvalidity"], st["uidnext"], int(time.time()), box))
+            db.commit()
+            if progress:
+                log(f"{box}: backfilled UID range ..{hi} "
+                    f"(+{f} new, {cached_count(db, box)} cached total)")
+
+    # 3. flags reconcile (explicit sync only)
+    changed = reconcile_flags(db, m, box)
+    db.execute(
+        "UPDATE sync_state SET uidnext=?, synced_at=? WHERE mailbox=?",
+        (st["uidnext"], int(time.time()), box))
+    db.commit()
+    return {"mailbox": box, "server_messages": st["messages"],
+            "cached": cached_count(db, box), "fetched": fetched,
+            "already_cached": skipped, "flags_updated": changed,
+            "backfill_cursor": cursor, "uidnext": st["uidnext"]}
+
+def implicit_sync(db, box, no_sync):
+    """Best-effort incremental sync; never fatal, keeps cache fresh on reads."""
+    if no_sync:
+        return
+    row = get_sync_row(db, box)
+    if row and row[3] and time.time() - row[3] < SYNC_STALENESS:
+        return
+    m = try_connect()
+    if m is None:
+        return  # offline: serve whatever the cache has
+    try:
+        st = mailbox_status(m, box)
+        if get_sync_row(db, box) is None or get_sync_row(db, box)[0] != st["uidvalidity"]:
+            sync_mailbox(db, m, box, full=False, progress=False)
+        else:
+            open_box(m, box)
+            typ, d = m.uid("SEARCH", "ALL")
+            server_uids = sorted(int(u) for u in d[0].split()) if d and d[0] else []
+            fetch_missing(db, m, box, server_uids[-QUICK_SEED:])
+            db.execute("UPDATE sync_state SET uidnext=?, synced_at=? WHERE mailbox=?",
+                       (st["uidnext"], int(time.time()), box))
+            db.commit()
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+# ----------------------------------------------------------- command impls
+
+def cmd_setup(args):
+    acct = input("Gmail address: ").strip()
+    if not acct:
+        die("empty account")
+    pw = getpass.getpass(
+        f"Google app password for {acct} (myaccount.google.com/apppasswords): ")
+    # Google displays app passwords as 4 groups of 4 chars; spaces are not
+    # part of the password.
+    pw = pw.replace(" ", "")
+    if not pw:
+        die("empty password")
+    r = subprocess.run(
+        ["security", "add-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct,
+         "-w", pw, "-U"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"Keychain store failed: {r.stderr.strip()}")
+    os.environ["GMMAIL_ACCOUNT"] = acct  # connect() reads account()/Keychain
+    m = connect()
+    # discover real system mailbox names (localisation-aware) via LIST attrs
+    boxes = {}
+    typ, listing = m.list()
+    if typ == "OK":
+        for b in listing or []:
+            if not isinstance(b, bytes):
+                continue
+            mm = re.match(rb"\(([^)]*)\)\s+\"[^\"]*\"\s+(.*)$", b)
+            if not mm:
+                continue
+            attrs = mm.group(1).decode(errors="replace").split()
+            name = mm.group(2).decode(errors="replace").strip('"')
+            for a in attrs:
+                if a in SPECIAL_USE_ATTR:
+                    boxes[SPECIAL_USE_ATTR[a]] = name
+    m.logout()
+    save_config({"account": acct, "mailboxes": boxes})
+    log(f"Account '{acct}' configured; app password stored in macOS Keychain "
+        f"and verified against Gmail.")
+    if boxes.get("trash", DEFAULT_GMAIL_NAMES["trash"]) != "[Gmail]/Trash":
+        log(f"note: localised Trash mailbox detected: {boxes['trash']} (handled)")
+
+def cmd_mailboxes(args):
+    db = open_db()
+    m = connect()
+    typ, boxes = m.list()
+    if typ != "OK":
+        die("LIST failed")
+    discovered = {}
+    out = []
+    for b in boxes:
+        if not isinstance(b, bytes):
+            continue
+        mm = re.match(rb"\(([^)]*)\)\s+\"[^\"]*\"\s+(.*)$", b)
+        if not mm:
+            continue
+        attrs_raw = mm.group(1).decode(errors="replace")
+        attrs = attrs_raw.split()
+        name = mm.group(2).decode(errors="replace").strip('"')
+        entry = {"mailbox": name, "attributes": attrs_raw}
+        for a in attrs:
+            if a in SPECIAL_USE_ATTR:
+                discovered[SPECIAL_USE_ATTR[a]] = name
+                entry["kind"] = SPECIAL_USE_ATTR[a]
+        if "\\Noselect" not in attrs:
+            try:
+                st = mailbox_status(m, name)
+                entry["messages"] = st["messages"]
+            except SystemExit:
+                entry["messages"] = None
+            entry["cached"] = cached_count(db, name)
+        out.append(entry)
+    m.logout()
+    if discovered:  # keep the alias map fresh
+        cfg = load_config()
+        cfg.setdefault("account", os.environ.get("GMMAIL_ACCOUNT"))
+        cfg["mailboxes"] = {**cfg.get("mailboxes", {}), **discovered}
+        save_config(cfg)
+    emit(out)
+
+def cmd_list(args):
+    db = open_db()
+    implicit_sync(db, args.mailbox, args.no_sync)
+    use_cache = (not args.live) and cached_count(db, args.mailbox) > 0
+    if use_cache:
+        sql = ("SELECT uid, date, from_addr, to_addr, subject, flags, gm_thrid "
+               "FROM messages WHERE mailbox=?")
+        params = [args.mailbox]
+        if args.unseen:
+            sql += " AND flags NOT LIKE '%\\Seen%'"
+        sql += " ORDER BY uid DESC LIMIT ?"
+        params.append(args.limit)
+        rows = [{"uid": r[0], "date": iso(r[1]), "from": r[2], "to": r[3],
+                 "subject": r[4], "flags": r[5], "thrid": r[6], "source": "cache"}
+                for r in db.execute(sql, params)]
+        emit({"mailbox": args.mailbox, "source": "cache", "count": len(rows),
+              "messages": rows})
+        return
+    m = connect()
+    open_box(m, args.mailbox)
+    typ, d = m.uid("SEARCH", "UNSEEN" if args.unseen else "ALL")
+    uids = sorted(int(u) for u in d[0].split()) if d and d[0] else []
+    latest = uids[-args.limit:][::-1]
+    rows = fetch_headers(m, latest)
+    m.logout()
+    for r in rows:
+        r["source"] = "live"
+    emit({"mailbox": args.mailbox, "source": "live", "count": len(rows),
+          "messages": rows})
+
+def render_message(box, uid, rec, meta, max_chars):
+    body, source = rec["body_text"], "text"
+    if not body and rec["body_html"]:
+        body, source = html_to_text(rec["body_html"]), "html-stripped"
+    truncated = False
+    if max_chars and len(body) > max_chars:
+        body = body[:max_chars]
+        truncated = True
+    return {
+        "mailbox": box, "uid": uid,
+        "gm_msgid": meta.get("gm_msgid"), "thrid": meta.get("gm_thrid"),
+        "web_url": web_url(meta),
+        "date": iso(rec["date"]), "from": rec["from_addr"], "to": rec["to_addr"],
+        "cc": rec["cc"], "subject": rec["subject"], "flags": meta.get("flags", ""),
+        "body_source": source, "truncated": truncated,
+        "attachments": json.loads(rec["attachments"] or "[]"),
+        "body": body,
+    }
+
+def cmd_read(args):
+    if args.raw:
+        m = connect()
+        open_box(m, args.mailbox)
+        for uid, meta, raw in fetch_full(m, [args.uid]):
+            sys.stdout.buffer.write(raw)
+            m.logout()
+            return
+        m.logout()
+        die(f"UID {args.uid} not found in {args.mailbox}")
+    db = open_db()
+    implicit_sync(db, args.mailbox, args.no_sync)
+    row = db.execute(
+        "SELECT gm_msgid, gm_thrid, message_id, date, from_addr, to_addr, cc,"
+        " subject, flags, size, body_text, body_html, attachments"
+        " FROM messages WHERE mailbox=? AND uid=?",
+        (args.mailbox, args.uid)).fetchone()
+    if row is not None:
+        meta = {"gm_msgid": row[0], "gm_thrid": row[1], "flags": row[8]}
+        rec = {"date": row[3], "from_addr": row[4], "to_addr": row[5], "cc": row[6],
+               "subject": row[7], "body_text": row[10], "body_html": row[11],
+               "attachments": row[12]}
+        out = render_message(args.mailbox, args.uid, rec, meta, args.max_chars)
+        out["source"] = "cache"
+        emit(out)
+        return
+    # cache miss -> live fetch, cache it, render
+    m = connect()
+    open_box(m, args.mailbox)
+    for uid, meta, raw in fetch_full(m, [args.uid]):
+        rec = parse_message(raw)
+        insert_record(db, args.mailbox, rec, uid, meta)
+        db.commit()
+        m.logout()
+        out = render_message(args.mailbox, uid, rec, meta, args.max_chars)
+        out["source"] = "live"
+        emit(out)
+        return
+    m.logout()
+    die(f"UID {args.uid} not found in {args.mailbox}")
+
+def cmd_search(args):
+    db = open_db()
+    if not args.live:
+        implicit_sync(db, args.mailbox, args.no_sync)
+        if cached_count(db, args.mailbox) > 0:
+            return search_fts(db, args)
+        log("gmmail: cache empty for this mailbox; falling back to --live search")
+    m = connect()
+    open_box(m, args.mailbox)
+    if args.gmail:
+        # server-side raw Gmail search syntax, within the selected mailbox
+        q = args.query.replace("\\", "\\\\").replace('"', '\\"')
+        crit = ["X-GM-RAW", f'"{q}"']
+    else:
+        crit = []
+        if args.unseen:
+            crit.append("UNSEEN")
+        if args.sender:
+            crit += ["FROM", f'"{args.sender}"']
+        if args.subject:
+            crit += ["SUBJECT", f'"{args.subject}"']
+        if args.since:
+            crit += ["SINCE", args.since]
+        for w in args.words:
+            crit += ["TEXT", f'"{w}"']
+    if not crit:
+        die("search needs at least one word or filter")
+    typ, d = m.uid("SEARCH", *crit)
+    if typ != "OK":
+        die(f"SEARCH failed: {d}")
+    uids = sorted(int(u) for u in d[0].split()) if d and d[0] else []
+    latest = uids[-args.limit:][::-1]
+    rows = fetch_headers(m, latest)
+    m.logout()
+    emit({"mailbox": args.mailbox, "source": "live", "total_hits": len(uids),
+          "count": len(rows), "messages": rows})
+
+def search_fts(db, args):
+    where, params = ["mail_fts MATCH ?"], [args.query]
+    where.append("m.mailbox=?"); params.append(args.mailbox)
+    if args.sender:
+        where.append("m.from_addr LIKE ?"); params.append(f"%{args.sender}%")
+    if args.since:
+        try:
+            ts = int(datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc).timestamp())
+            where.append("m.date >= ?"); params.append(ts)
+        except ValueError:
+            die(f"--since must be ISO date (e.g. 2026-01-01), got '{args.since}'")
+    if args.unseen:
+        where.append("m.flags NOT LIKE '%\\Seen%'")
+    # rank in a CTE first (CROSS JOIN pins scan order: FTS first, rowid probes),
+    # then compute the expensive snippet() only for the rows that survive LIMIT
+    sql = f"""
+      WITH top AS (
+        SELECT m.rowid AS rid, bm25(mail_fts, 10.0, 5.0, 1.0, 1.0) AS r
+        FROM mail_fts CROSS JOIN messages m ON m.rowid = mail_fts.rowid
+        WHERE {' AND '.join(where)}
+        ORDER BY r LIMIT ?)
+      SELECT m.uid, m.date, m.from_addr, m.subject, m.flags, m.gm_thrid,
+             snippet(mail_fts, 3, '>>>', '<<<', '...', 24), top.r
+      FROM top JOIN messages m ON m.rowid = top.rid
+      JOIN mail_fts ON mail_fts.rowid = top.rid
+      ORDER BY top.r"""
+    params.append(args.limit)
+    try:
+        rows = db.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        # not a valid FTS5 query: treat words as an AND of quoted terms
+        terms = args.query.split()
+        if not terms:
+            die("empty search query")
+        params[0] = " AND ".join('"' + t.replace('"', '') + '"' for t in terms)
+        try:
+            rows = db.execute(sql, params).fetchall()
+        except sqlite3.OperationalError as e:
+            die(f"search failed: {e}")
+    out = [{"uid": r[0], "date": iso(r[1]), "from": r[2], "subject": r[3],
+            "flags": r[4], "thrid": r[5],
+            "snippet": INVISIBLES_RE.sub("", re.sub(r"\s+", " ", r[6] or "")).strip(),
+            "rank": round(r[7], 3)} for r in rows]
+    emit({"mailbox": args.mailbox, "source": "cache-fts", "query": args.query,
+          "count": len(out), "messages": out})
+
+def cmd_sync(args):
+    db = open_db()
+    m = connect()
+    if args.all:
+        typ, boxes = m.list()
+        targets = []
+        for b in boxes or []:
+            if isinstance(b, bytes):
+                mm = re.match(rb"\(([^)]*)\)\s+\"[^\"]*\"\s+(.*)$", b)
+                if mm and b"\\Noselect" not in mm.group(1):
+                    targets.append(mm.group(2).decode(errors="replace").strip('"'))
+        all_mail = resolve_mailbox("All Mail")
+        if len(targets) > 1 and all_mail in targets and args.skip_all_mail:
+            targets.remove(all_mail)
+        # backfill the biggest (All Mail) last so smaller boxes finish first
+        targets.sort(key=lambda t: (t == all_mail, t))
+    else:
+        targets = [args.mailbox]
+    results = []
+    for box in targets:
+        results.append(sync_mailbox(db, m, box, full=args.full, batch=args.batch))
+    m.logout()
+    emit({"synced": results})
+
+def cmd_status(args):
+    db = open_db()
+    rows = []
+    for box, uidvalidity, cursor, uidnext, synced_at in db.execute(
+            "SELECT mailbox, uidvalidity, backfill_cursor, uidnext, synced_at "
+            "FROM sync_state ORDER BY mailbox"):
+        rows.append({
+            "mailbox": box, "cached": cached_count(db, box),
+            "server_messages": (uidnext - 1) if uidnext else None,
+            "backfill_complete": bool(uidnext and cursor >= uidnext - 1),
+            "backfill_cursor": cursor, "uidnext": uidnext,
+            "last_sync": iso(synced_at),
+        })
+    db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    attach = []
+    if os.path.isdir(ATTACH_DIR):
+        attach = os.listdir(ATTACH_DIR)
+    emit({"db_path": DB_PATH, "db_size_mb": round(db_size / 1e6, 1),
+          "mailboxes": rows, "attachments_saved": len(attach)})
+
+def cmd_save_attach(args):
+    db = open_db()
+    os.makedirs(ATTACH_DIR, exist_ok=True)
+    m = connect()
+    open_box(m, args.mailbox)
+    for uid, meta, raw in fetch_full(m, [args.uid]):
+        msg = BytesParser(policy=policy.default).parsebytes(raw)
+        idx = 0
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            filename = part.get_filename()
+            if part.get_content_disposition() == "attachment" or filename:
+                idx += 1
+                if idx == args.index:
+                    payload = part.get_payload(decode=True)
+                    if payload is None:
+                        m.logout()
+                        die(f"attachment {args.index} has no decodable payload")
+                    safe = re.sub(r"[^\w.\-]+", "_", filename or f"attachment-{idx}")
+                    path = os.path.join(ATTACH_DIR,
+                                        f"{args.mailbox.replace('/', '_')}-{uid}-{idx}-{safe}")
+                    with open(path, "wb") as f:
+                        f.write(payload)
+                    m.logout()
+                    emit({"saved": path, "name": filename, "mime": part.get_content_type(),
+                          "size": len(payload)})
+                    return
+        m.logout()
+        die(f"message UID {args.uid} has only {idx} attachment(s)")
+    m.logout()
+    die(f"UID {args.uid} not found in {args.mailbox}")
+
+# --------------------------------------------------------------------- CLI
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="gmmail",
+        description="Read Gmail via imap.gmail.com IMAP. Read-only. JSON on stdout.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("setup", help="store a Google app password in macOS Keychain")
+    sp.set_defaults(fn=cmd_setup)
+
+    sp = sub.add_parser("mailboxes", help="list folders/labels with counts")
+    sp.set_defaults(fn=cmd_mailboxes)
+
+    sp = sub.add_parser("list", help="list messages (default: INBOX, cache-first)")
+    sp.add_argument("mailbox", nargs="?", default="INBOX")
+    sp.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    sp.add_argument("--unseen", action="store_true")
+    sp.add_argument("--live", action="store_true", help="bypass cache, query Gmail")
+    sp.add_argument("--no-sync", action="store_true", help="skip implicit incremental sync")
+    sp.set_defaults(fn=cmd_list)
+
+    sp = sub.add_parser("read", help="read one message by UID (cache-first)")
+    sp.add_argument("uid", type=int)
+    sp.add_argument("--mailbox", default="INBOX")
+    sp.add_argument("--raw", action="store_true", help="dump untouched RFC822 to stdout")
+    sp.add_argument("--max-chars", type=int, default=20000, help="0 = no limit")
+    sp.add_argument("--no-sync", action="store_true")
+    sp.set_defaults(fn=cmd_read)
+
+    sp = sub.add_parser("search", help="full-text search (FTS5 cache) or live IMAP search")
+    sp.add_argument("words", nargs="*", help="keywords (AND-ed); quotes/phrases passed to FTS5")
+    sp.add_argument("--mailbox", default="All Mail")
+    sp.add_argument("--from", dest="sender")
+    sp.add_argument("--subject")
+    sp.add_argument("--since", help="ISO date, e.g. 2026-01-01")
+    sp.add_argument("--unseen", action="store_true")
+    sp.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    sp.add_argument("--live", action="store_true")
+    sp.add_argument("--gmail", action="store_true",
+                    help="treat words as one raw Gmail search query, e.g. "
+                         "--gmail 'from:bob has:attachment newer_than:7d' (implies --live)")
+    sp.add_argument("--no-sync", action="store_true")
+    sp.set_defaults(fn=cmd_search)
+
+    sp = sub.add_parser("sync", help="sync mailbox(es) into the local cache")
+    sp.add_argument("--mailbox", default="INBOX")
+    sp.add_argument("--all", action="store_true", help="sync every folder/label")
+    sp.add_argument("--skip-all-mail", action="store_true",
+                    help="with --all: skip All Mail (it duplicates the other mailboxes)")
+    sp.add_argument("--full", action="store_true", help="run/resume full backfill")
+    sp.add_argument("--batch", type=int, default=BACKFILL_BATCH)
+    sp.set_defaults(fn=cmd_sync)
+
+    sp = sub.add_parser("status", help="cache state per mailbox")
+    sp.set_defaults(fn=cmd_status)
+
+    sp = sub.add_parser("save-attach", help="download attachment N of message UID")
+    sp.add_argument("uid", type=int)
+    sp.add_argument("index", type=int, help="attachment index from `read` output (1-based)")
+    sp.add_argument("--mailbox", default="INBOX")
+    sp.set_defaults(fn=cmd_save_attach)
+    return p
+
+def main():
+    args = build_parser().parse_args()
+    if hasattr(args, "mailbox"):
+        args.mailbox = resolve_mailbox(args.mailbox)
+    if args.cmd == "search":
+        args.query = " ".join(args.words)
+        if args.gmail:
+            args.live = True
+        if not args.live and not args.query and not (args.sender or args.subject):
+            die("search needs at least one word (cached search is text-based)")
+    args.fn(args)
+
+if __name__ == "__main__":
+    main()
