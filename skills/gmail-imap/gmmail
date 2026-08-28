@@ -6,8 +6,9 @@ fetched with BODY.PEEK, mailboxes are opened with EXAMINE, and no command
 ever stores flags, moves, or deletes mail.
 
 Auth: Google app password (myaccount.google.com/apppasswords, requires 2FA),
-stored in macOS Keychain. Cache: ~/.local/share/gmmail/mail.db (SQLite +
-FTS5, rebuildable). Override the server with GMMAIL_HOST / GMMAIL_PORT.
+stored in macOS Keychain or a mode-0600 credentials file on Linux. Cache:
+~/.local/share/gmmail/mail.db (SQLite + FTS5, rebuildable). Override the
+server with GMMAIL_HOST / GMMAIL_PORT.
 
 All data commands print JSON on stdout; progress and errors go to stderr.
 """
@@ -18,6 +19,7 @@ import imaplib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import ssl
 import subprocess
@@ -35,9 +37,45 @@ DATA_DIR = os.path.expanduser(os.environ.get("GMMAIL_DATA", "~/.local/share/gmma
 DB_PATH = os.path.join(DATA_DIR, "mail.db")
 ATTACH_DIR = os.path.join(DATA_DIR, "attachments")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+CONFIG_HOME = os.path.expanduser(os.environ.get("XDG_CONFIG_HOME", "~/.config"))
+CREDENTIALS_PATH = os.path.join(CONFIG_HOME, "gmmail", "credentials.json")
+
+def load_file_credentials():
+    """Read the Linux credential file, refusing unsafe permissions."""
+    try:
+        if os.stat(CREDENTIALS_PATH).st_mode & 0o077:
+            die(f"credential file permissions are too open: {CREDENTIALS_PATH}; "
+                f"run `chmod 600 {CREDENTIALS_PATH}`")
+        with open(CREDENTIALS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"cannot read credential file {CREDENTIALS_PATH}: {e}")
+
+
+def save_file_credentials(acct, pw):
+    """Atomically write Linux credentials with owner-only permissions."""
+    directory = os.path.dirname(CREDENTIALS_PATH)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    tmp = CREDENTIALS_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"account": acct, "app_password": pw}, f)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CREDENTIALS_PATH)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
 
 def account():
-    """Gmail address: $GMMAIL_ACCOUNT, else the config written by setup."""
+    """Gmail address: environment, config, then Linux credential file."""
     a = os.environ.get("GMMAIL_ACCOUNT")
     if a:
         return a
@@ -48,6 +86,9 @@ def account():
                 return a
     except (OSError, json.JSONDecodeError):
         pass
+    a = load_file_credentials().get("account")
+    if a:
+        return a
     die("no account configured - run `gmmail setup` first (or set GMMAIL_ACCOUNT)")
 
 DEFAULT_LIMIT = 20
@@ -140,13 +181,17 @@ def get_password():
     pw = os.environ.get("GMMAIL_PASSWORD")
     if pw:
         return pw
-    r = subprocess.run(
-        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account(), "-w"],
-        capture_output=True, text=True)
-    if r.returncode != 0:
-        die(f"no credentials: store a Google app password with `gmmail setup`, "
-            f"or set GMMAIL_PASSWORD (Keychain service '{KEYCHAIN_SERVICE}', account '{account()}')")
-    return r.stdout.rstrip("\n")
+    if sys.platform == "darwin" and shutil.which("security"):
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+             "-a", account(), "-w"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.rstrip("\n"):
+            return r.stdout.rstrip("\n")
+    creds = load_file_credentials()
+    if creds.get("account") == account() and creds.get("app_password"):
+        return creds["app_password"]
+    die("no credentials: run `gmmail setup` to store a Google app password, "
+        "or set GMMAIL_PASSWORD")
 
 # ------------------------------------------------------------------- IMAP
 
@@ -570,12 +615,9 @@ def cmd_setup(args):
     pw = pw.replace(" ", "")
     if not pw:
         die("empty password")
-    r = subprocess.run(
-        ["security", "add-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct,
-         "-w", pw, "-U"], capture_output=True, text=True)
-    if r.returncode != 0:
-        die(f"Keychain store failed: {r.stderr.strip()}")
-    os.environ["GMMAIL_ACCOUNT"] = acct  # connect() reads account()/Keychain
+    # Verify before persisting the app password.
+    os.environ["GMMAIL_ACCOUNT"] = acct
+    os.environ["GMMAIL_PASSWORD"] = pw
     m = connect()
     # discover real system mailbox names (localisation-aware) via LIST attrs
     boxes = {}
@@ -593,8 +635,18 @@ def cmd_setup(args):
                 if a in SPECIAL_USE_ATTR:
                     boxes[SPECIAL_USE_ATTR[a]] = name
     m.logout()
+    if sys.platform == "darwin" and shutil.which("security"):
+        r = subprocess.run(
+            ["security", "add-generic-password", "-s", KEYCHAIN_SERVICE,
+             "-a", acct, "-w", pw, "-U"], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"Keychain store failed: {r.stderr.strip()}")
+        credential_store = "macOS Keychain"
+    else:
+        save_file_credentials(acct, pw)
+        credential_store = CREDENTIALS_PATH
     save_config({"account": acct, "mailboxes": boxes})
-    log(f"Account '{acct}' configured; app password stored in macOS Keychain "
+    log(f"Account '{acct}' configured; app password stored in {credential_store} "
         f"and verified against Gmail.")
     if boxes.get("trash", DEFAULT_GMAIL_NAMES["trash"]) != "[Gmail]/Trash":
         log(f"note: localised Trash mailbox detected: {boxes['trash']} (handled)")
@@ -895,7 +947,7 @@ def build_parser():
         description="Read Gmail via imap.gmail.com IMAP. Read-only. JSON on stdout.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("setup", help="store a Google app password in macOS Keychain")
+    sp = sub.add_parser("setup", help="verify and securely store a Google app password")
     sp.set_defaults(fn=cmd_setup)
 
     sp = sub.add_parser("mailboxes", help="list folders/labels with counts")

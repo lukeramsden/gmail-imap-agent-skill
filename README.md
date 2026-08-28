@@ -6,7 +6,7 @@ The skill ships `gmmail`, a zero-dependency Python CLI (stdlib only) that talks 
 
 ## Requirements
 
-- macOS (credentials are stored in the system Keychain)
+- macOS or Linux
 - A personal Gmail account with 2-Step Verification enabled and an [app password](https://myaccount.google.com/apppasswords)
 - Python 3.9+ (no packages to install — stdlib only)
 
@@ -36,7 +36,7 @@ npx skills add lukeramsden/gmail-imap-agent-skill --list
 
 ```bash
 ./doctor                              # verify all runtime dependencies
-./gmmail setup                        # Gmail address + app password -> Keychain
+./gmmail setup                        # Gmail address + app password -> secure credential store
 ./gmmail sync --all --full            # backfill the whole archive (resumable)
 ./gmmail search "invoice"             # ranked full-text search, sub-second
 ./gmmail search --gmail 'from:bob has:attachment newer_than:7d'
@@ -62,7 +62,7 @@ All commands print JSON on stdout; progress and errors go to stderr.
 ## Privacy and security
 
 - Direct TLS connection to `imap.gmail.com:993` with full certificate verification; nothing else is ever contacted
-- The app password lives in macOS Keychain (service `gmmail-gmail`); the only on-disk config is your account email in `~/.local/share/gmmail/config.json` (mode 600)
+- On macOS, the app password lives in Keychain (service `gmmail-gmail`). On Linux, it is stored in `~/.config/gmmail/credentials.json` with owner-only permissions (mode 600).
 - The cache (`~/.local/share/gmmail/`) is fully rebuildable — delete it anytime and re-run `gmmail sync --all --full`
 - The app password can be revoked anytime at myaccount.google.com/apppasswords
 
