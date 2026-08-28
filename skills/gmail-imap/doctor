@@ -9,6 +9,7 @@ data directory if missing).
 Run: ./doctor from the skill directory.
 """
 
+import json
 import os
 import shutil
 import socket
@@ -24,18 +25,39 @@ KEYCHAIN_SERVICE = "gmmail-gmail"
 DATA_DIR = os.path.expanduser(os.environ.get("GMMAIL_DATA", "~/.local/share/gmmail"))
 DB_PATH = os.path.join(DATA_DIR, "mail.db")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+CONFIG_HOME = os.path.expanduser(os.environ.get("XDG_CONFIG_HOME", "~/.config"))
+CREDENTIALS_PATH = os.path.join(CONFIG_HOME, "gmmail", "credentials.json")
+
+def file_credentials():
+    """Return (credentials, error) without ever printing the secret."""
+    try:
+        if os.stat(CREDENTIALS_PATH).st_mode & 0o077:
+            return {}, f"permissions are too open; run `chmod 600 {CREDENTIALS_PATH}`"
+        with open(CREDENTIALS_PATH) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}, "file does not contain a JSON object"
+        return data, None
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, json.JSONDecodeError) as e:
+        return {}, str(e)
+
+FILE_CREDS, FILE_CREDS_ERROR = file_credentials()
 
 def configured_account():
-    """$GMMAIL_ACCOUNT, else the account written by `gmmail setup`. May be None."""
+    """Environment, setup config, or Linux credential file. May be None."""
     a = os.environ.get("GMMAIL_ACCOUNT")
     if a:
         return a
     try:
-        import json
         with open(CONFIG_PATH) as f:
-            return json.load(f).get("account")
+            a = json.load(f).get("account")
+            if a:
+                return a
     except (OSError, ValueError):
-        return None
+        pass
+    return FILE_CREDS.get("account")
 
 ACCOUNT = configured_account()
 
@@ -70,26 +92,37 @@ try:
 except Exception as e:
     check(False, "sqlite3 FTS5 extension", fix=f"python3 sqlite3 lacks FTS5: {e}")
 
-# 3. macOS `security` CLI (Keychain access)
-check(shutil.which("security") is not None, "`security` CLI on PATH",
-      fix="expected on macOS; if missing, set GMMAIL_PASSWORD instead")
+# 3. credential provider
+if sys.platform == "darwin":
+    provider_ok = shutil.which("security") is not None
+    check(provider_ok, "credential provider", info="macOS Keychain" if provider_ok else None,
+          fix="the macOS `security` CLI is missing; set GMMAIL_PASSWORD instead")
+else:
+    check(FILE_CREDS_ERROR is None, "credential provider",
+          info=f"Linux credential file ({CREDENTIALS_PATH})",
+          fix=FILE_CREDS_ERROR)
 
 # 4. account configured, then credentials available; never print the secret
 acct_ok = check(ACCOUNT is not None, "account configured",
-                info="$GMMAIL_ACCOUNT" if os.environ.get("GMMAIL_ACCOUNT") else "gmmail setup config",
-                fix="run `gmmail setup` (stores only the email address in "
+                info=("$GMMAIL_ACCOUNT" if os.environ.get("GMMAIL_ACCOUNT")
+                      else "gmmail setup config"),
+                fix="run `gmmail setup` (stores the email address in "
                     f"{CONFIG_PATH}), or set GMMAIL_ACCOUNT")
 pw = os.environ.get("GMMAIL_PASSWORD")
 cred_source = "GMMAIL_PASSWORD env var" if pw else None
-if not pw and acct_ok:
+if not pw and acct_ok and sys.platform == "darwin" and shutil.which("security"):
     r = subprocess.run(
         ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", ACCOUNT, "-w"],
         capture_output=True, text=True)
     if r.returncode == 0 and r.stdout.strip():
         pw = r.stdout.strip()
         cred_source = f"Keychain (service '{KEYCHAIN_SERVICE}')"
+if not pw and acct_ok and not FILE_CREDS_ERROR:
+    if FILE_CREDS.get("account") == ACCOUNT and FILE_CREDS.get("app_password"):
+        pw = FILE_CREDS["app_password"]
+        cred_source = f"credential file ({CREDENTIALS_PATH})"
 check(pw is not None, "app password available", info=cred_source,
-      fix="run `gmmail setup` to store a Google app password in Keychain "
+      fix="run `gmmail setup` to store a Google app password "
           "(myaccount.google.com/apppasswords, requires 2FA), or set GMMAIL_PASSWORD")
 
 # 5. Gmail IMAP TCP port reachable

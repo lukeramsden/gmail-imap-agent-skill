@@ -24,8 +24,8 @@ Pipe through `jq` when you need to reshape output.
 ```
 
 It checks every runtime dependency (python/sqlite, account configuration,
-Keychain credentials, network + TLS + login to imap.gmail.com, cache
-database, disk space) and prints an actionable fix for each failure.
+credential storage, network + TLS + login to imap.gmail.com, cache database,
+disk space) and prints an actionable fix for each failure.
 
 ## First-time setup
 
@@ -33,8 +33,9 @@ Run `./doctor` — it reports anything missing. On a fresh machine it will ask
 you to run `./gmmail setup`, which prompts for the Gmail address and a
 **Google app password** (create one at myaccount.google.com/apppasswords —
 requires 2FA; paste it with or without spaces), verifies them against Gmail,
-stores the password in macOS Keychain, discovers the account's system
-mailbox names, and writes config to `~/.local/share/gmmail/config.json`.
+stores the password in macOS Keychain or an owner-only credential file on
+Linux, discovers the account's system mailbox names, and writes config to
+`~/.local/share/gmmail/config.json`.
 
 Gmail IMAP never accepts the normal Google account password — only app
 passwords.
@@ -90,12 +91,13 @@ gmmail save-attach <uid> <index> [--mailbox M]   # index comes from `read` outpu
 
 ## Credentials
 
-The app password is read from macOS Keychain (service `gmmail-gmail`) or
-`$GMMAIL_PASSWORD`; the account email comes from `$GMMAIL_ACCOUNT` or the
-config written by `gmmail setup`. To store or rotate credentials:
+The app password is read from `$GMMAIL_PASSWORD`, macOS Keychain (service
+`gmmail-gmail`), or `~/.config/gmmail/credentials.json` on Linux. The account
+email comes from `$GMMAIL_ACCOUNT` or the config written by `gmmail setup`.
+To store or rotate credentials:
 
 ```bash
-gmmail setup        # prompts for Gmail address + app password, verifies login
+gmmail setup        # prompts for Gmail address + app password and stores it securely
 ```
 
 If logins start failing, revoke the old app password at
