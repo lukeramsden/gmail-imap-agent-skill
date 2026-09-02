@@ -1,15 +1,37 @@
 {
   "name": "gmail-imap-agent-skill",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Agent skill: read-only Gmail access over IMAP with a local SQLite FTS cache (gmmail CLI, Python stdlib only).",
   "license": "MIT",
   "author": "lukeramsden",
-  "repository": { "type": "git", "url": "git+https://github.com/lukeramsden/gmail-imap-agent-skill.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukeramsden/gmail-imap-agent-skill.git"
+  },
   "homepage": "https://github.com/lukeramsden/gmail-imap-agent-skill#readme",
   "bugs": "https://github.com/lukeramsden/gmail-imap-agent-skill/issues",
-  "keywords": [ "pi-package", "pi-skill", "pi-coding-agent", "agent-skill", "gmail-imap" ],
-  "pi": { "skills": [ "./skills" ] },
-  "bin": { "gmmail": "skills/gmail-imap/gmmail" },
-  "files": [ "skills", "README.md", "LICENSE", "NOTICE" ],
-  "scripts": { "verify": "python3 -m py_compile skills/*/gmmail skills/*/doctor && python3 -m unittest discover -s tests" }
+  "keywords": [
+    "pi-package",
+    "pi-skill",
+    "pi-coding-agent",
+    "agent-skill",
+    "gmail-imap"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "bin": {
+    "gmmail": "skills/gmail-imap/gmmail"
+  },
+  "files": [
+    "skills",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "verify": "python3 -m py_compile skills/*/gmmail skills/*/doctor && python3 -m unittest discover -s tests"
+  }
 }
