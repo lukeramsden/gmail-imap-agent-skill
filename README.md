@@ -79,3 +79,18 @@ skills/
 ## License
 
 This repository is available under the MIT License. See [NOTICE](NOTICE) for trademark attribution.
+
+## Install as a pi package
+
+```bash
+pi install npm:gmail-imap-agent-skill
+```
+
+## Releasing
+
+```bash
+npm version patch|minor|major && git push --follow-tags
+```
+
+The `v*` tag triggers `.github/workflows/publish.yml`, which publishes to npm
+with OIDC trusted publishing and provenance.
