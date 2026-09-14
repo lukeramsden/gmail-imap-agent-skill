@@ -15,7 +15,8 @@ The CLI is `gmmail` in this skill's directory. Run commands from the skill
 directory as `./gmmail <command> ...` (or invoke it by its absolute path).
 
 All data commands print **JSON on stdout**; progress and errors go to stderr.
-Pipe through `jq` when you need to reshape output.
+Pipe through `jq` when you need to reshape output — see [Output shapes](#output-shapes)
+for which key holds the rows (`list`/`search` return a wrapper object, not an array).
 
 **If gmmail fails or behaves unexpectedly, run the doctor script first:**
 
@@ -52,6 +53,26 @@ gmmail sync [--mailbox M | --all] [--full] [--skip-all-mail]
 gmmail status                           # cache state per mailbox, db size
 gmmail save-attach <uid> <index> [--mailbox M]   # index comes from `read` output
 ```
+
+## Output shapes
+
+Every command returns a **single JSON object** (except `mailboxes`, which is
+an array). Rows live under one key; check `count` before concluding that
+nothing matched — `jq '.[]'` on a wrapper object is *not* an empty result, it
+is the wrong selector.
+
+| Command | Top-level keys | Rows | `jq` |
+|---|---|---|---|
+| `list` | `mailbox, source, count, messages` | `messages[]` → `uid, date, from, to, subject, flags, thrid, source` | `jq '.messages[]'` |
+| `search` (cached) | `mailbox, source:"cache-fts", query, count, messages` | `messages[]` → `uid, date, from, subject, flags, thrid, snippet, rank` | `jq '.messages[]'` |
+| `search --live` / `--gmail` | `mailbox, source:"live", total_hits, count, messages` | `messages[]` → `uid, date, from, to, subject, flags, thrid` (`count` ≤ `--limit`; `total_hits` is the server total) | `jq '.messages[]'` |
+| `read` | `mailbox, uid, gm_msgid, thrid, web_url, date, from, to, cc, subject, flags, body_source, truncated, attachments, body, source` | one message; `attachments[]` → `index, name, mime, size` (the `index` is what `save-attach` takes) | `jq '.attachments[]'` |
+| `mailboxes` | *(array)* | each → `mailbox, attributes, [kind], messages, cached` | `jq '.[]'` |
+| `status` | `db_path, db_size_mb, mailboxes, attachments_saved` | `mailboxes[]` → `mailbox, cached, server_messages, backfill_complete, ...` | `jq '.mailboxes[]'` |
+| `sync` | `synced` | `synced[]` → per-mailbox counts | `jq '.synced[]'` |
+| `save-attach` | `saved, name, mime, size` | `saved` is the absolute path written | — |
+
+`read --raw` is the exception: it writes the raw RFC822 bytes, not JSON.
 
 ## Behavior notes
 

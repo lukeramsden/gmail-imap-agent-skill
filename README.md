@@ -45,7 +45,9 @@ npx skills add lukeramsden/gmail-imap-agent-skill --list
 ./gmmail save-attach 34655 1
 ```
 
-All commands print JSON on stdout; progress and errors go to stderr.
+All commands print JSON on stdout; progress and errors go to stderr. `list` and
+`search` return `{mailbox, source, count, messages: [...]}` — use `jq '.messages[]'`
+for the rows (full table in `skills/gmail-imap/SKILL.md`).
 
 ## What the skill provides
 
